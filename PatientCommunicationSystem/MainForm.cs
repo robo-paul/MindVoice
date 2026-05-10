@@ -2,26 +2,327 @@
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.IO.Ports;
+using System.Linq;
 using System.Threading;
 using System.Windows.Forms;
-using libStreamSDK;
 
 namespace PatientCommunicationSystem
 {
     public partial class MainForm : Form
     {
-        // NeuroSky variables
-        private int connectionId;
+        // ============================================================================
+        // Constants (Following Python Structure)
+        // ============================================================================
+        
+        private const byte SYNC_BYTE = 0xAA;
+        private const byte EXCODE_BYTE = 0x55;
+        private const int BAUDRATE = 57600;
+        
+        // Blink detection parameters (will auto-calibrate)
+        private double BLINK_THRESHOLD = 150;     // Start with this, will adjust
+        private double BLINK_COOLDOWN = 0.3;       // Seconds between blinks
+        private double BLINK_RISE_THRESHOLD = 150; // Minimum rise from baseline
+        
+        private const bool DEBUG = true;
+
+        // ============================================================================
+        // BlinkDetectorParser Class (Following Python Structure)
+        // ============================================================================
+        
+        private class BlinkDetectorParser
+        {
+            private List<byte> buffer = new List<byte>();
+            private bool inPacket = false;
+            private int packetLength = 0;
+            public int packetCount = 0;
+            
+            // EEG Data
+            public List<int> rawSamples = new List<int>();
+            public int poorSignal = 255;
+            public int attention = 0;
+            public int meditation = 0;
+            
+            // Blink detection variables
+            public int blinkStrength = 0;
+            private DateTime lastBlinkTime = DateTime.MinValue;
+            public int blinkCount = 0;
+            private Queue<BlinkEvent> recentBlinks = new Queue<BlinkEvent>();
+            
+            // For baseline calibration
+            private List<double> baselineValues = new List<double>();
+            public bool isCalibrated = false;
+            public double blinkThreshold;
+            public double riseThreshold;
+            
+            // Signal smoothing
+            private int lastRawValue = 0;
+            private Queue<int> rawHistory = new Queue<int>();
+            
+            // Event for blink detection
+            public event Action<BlinkEvent> OnBlinkDetected;
+            
+            private class BlinkEvent
+            {
+                public DateTime Time { get; set; }
+                public double Strength { get; set; }
+                public double Rise { get; set; }
+                public string Type { get; set; }
+            }
+            
+            public BlinkDetectorParser()
+            {
+                blinkThreshold = BLINK_THRESHOLD;
+                riseThreshold = BLINK_RISE_THRESHOLD;
+            }
+            
+            public void FeedByte(byte byteVal)
+            {
+                buffer.Add(byteVal);
+                
+                // Look for sync pattern
+                if (buffer.Count >= 2 && buffer[buffer.Count - 2] == SYNC_BYTE && buffer[buffer.Count - 1] == SYNC_BYTE)
+                {
+                    inPacket = true;
+                    packetLength = 0;
+                    buffer.Clear();
+                    buffer.Add(SYNC_BYTE);
+                    buffer.Add(SYNC_BYTE);
+                    return;
+                }
+                
+                if (!inPacket) return;
+                
+                // Get payload length
+                if (packetLength == 0 && buffer.Count >= 3)
+                {
+                    packetLength = buffer[2];
+                }
+                
+                // Check if we have complete packet (SYNC, SYNC, LENGTH, PAYLOAD, CHECKSUM)
+                if (packetLength > 0 && buffer.Count >= packetLength + 4)
+                {
+                    ParsePacket();
+                }
+            }
+            
+            private void ParsePacket()
+            {
+                if (buffer.Count < 4)
+                {
+                    inPacket = false;
+                    buffer.Clear();
+                    return;
+                }
+                
+                // Extract payload
+                List<byte> payload = buffer.GetRange(3, packetLength);
+                byte checksum = buffer[packetLength + 3];
+                byte calcChecksum = (byte)(~payload.Sum(b => (int)b) & 0xFF);
+                
+                if (calcChecksum != checksum)
+                {
+                    inPacket = false;
+                    buffer.Clear();
+                    return;
+                }
+                
+                packetCount++;
+                
+                // Parse payload rows
+                int i = 0;
+                while (i < payload.Count)
+                {
+                    byte code = payload[i];
+                    i++;
+                    
+                    if (code == EXCODE_BYTE && i < payload.Count)
+                    {
+                        code = payload[i];
+                        i++;
+                    }
+                    
+                    if (i < payload.Count)
+                    {
+                        int valueLength = payload[i];
+                        i++;
+                        
+                        if (i + valueLength <= payload.Count)
+                        {
+                            // Process different data types
+                            switch (code)
+                            {
+                                case 0x02: // Poor Signal
+                                    if (valueLength >= 1)
+                                        poorSignal = payload[i];
+                                    break;
+                                    
+                                case 0x04: // Attention
+                                    if (valueLength == 1)
+                                        attention = payload[i];
+                                    else if (valueLength == 2)
+                                        attention = (payload[i] << 8) | payload[i + 1];
+                                    break;
+                                    
+                                case 0x05: // Meditation
+                                    if (valueLength == 1)
+                                        meditation = payload[i];
+                                    else if (valueLength == 2)
+                                        meditation = (payload[i] << 8) | payload[i + 1];
+                                    break;
+                                    
+                                case 0x16: // Blink Strength (from headset)
+                                    if (valueLength >= 1)
+                                    {
+                                        blinkStrength = payload[i];
+                                        CheckForBlink();
+                                    }
+                                    break;
+                                    
+                                case 0x80: // Raw Wave (our own blink detection)
+                                    if (valueLength == 2)
+                                    {
+                                        int raw = (payload[i] << 8) | payload[i + 1];
+                                        if (raw > 32767)
+                                            raw = raw - 65536;
+                                        rawSamples.Add(raw);
+                                        DetectBlinkFromRaw(raw);
+                                    }
+                                    break;
+                            }
+                            
+                            i += valueLength;
+                        }
+                    }
+                }
+                
+                inPacket = false;
+                buffer.Clear();
+            }
+            
+            private void CheckForBlink()
+            {
+                DateTime currentTime = DateTime.Now;
+                
+                // Headset sends non-zero values when a blink is detected
+                if (blinkStrength > 0)
+                {
+                    if ((currentTime - lastBlinkTime).TotalSeconds >= BLINK_COOLDOWN)
+                    {
+                        blinkCount++;
+                        lastBlinkTime = currentTime;
+                        
+                        var blinkEvent = new BlinkEvent
+                        {
+                            Time = currentTime,
+                            Strength = blinkStrength,
+                            Type = "headset"
+                        };
+                        
+                        recentBlinks.Enqueue(blinkEvent);
+                        if (recentBlinks.Count > 10)
+                            recentBlinks.Dequeue();
+                        
+                        OnBlinkDetected?.Invoke(blinkEvent);
+                    }
+                }
+            }
+            
+            private void DetectBlinkFromRaw(int rawValue)
+            {
+                DateTime currentTime = DateTime.Now;
+                
+                // Store raw value
+                rawHistory.Enqueue(rawValue);
+                if (rawHistory.Count > 10)
+                    rawHistory.Dequeue();
+                
+                // Calibration phase - collect baseline
+                if (!isCalibrated)
+                {
+                    baselineValues.Add(Math.Abs(rawValue));
+                    
+                    if (baselineValues.Count > 500)
+                    {
+                        // Calculate baseline average
+                        double avgBaseline = baselineValues.Average();
+                        blinkThreshold = avgBaseline * 5;  // 5x baseline
+                        riseThreshold = avgBaseline * 2;
+                        isCalibrated = true;
+                    }
+                    return;
+                }
+                
+                // Detect blink - sudden large spike
+                if (rawHistory.Count >= 3)
+                {
+                    double absValue = Math.Abs(rawValue);
+                    double prevAbs = 0;
+                    
+                    if (rawHistory.Count >= 2)
+                    {
+                        var historyArray = rawHistory.ToArray();
+                        prevAbs = Math.Abs(historyArray[historyArray.Length - 2]);
+                    }
+                    
+                    double rise = absValue - prevAbs;
+                    
+                    // Check for blink signature: sharp rise then fall
+                    if ((absValue > blinkThreshold || (rise > riseThreshold && absValue > 100)))
+                    {
+                        if ((currentTime - lastBlinkTime).TotalSeconds >= BLINK_COOLDOWN)
+                        {
+                            blinkCount++;
+                            lastBlinkTime = currentTime;
+                            
+                            var blinkEvent = new BlinkEvent
+                            {
+                                Time = currentTime,
+                                Strength = absValue,
+                                Rise = rise,
+                                Type = "raw"
+                            };
+                            
+                            recentBlinks.Enqueue(blinkEvent);
+                            if (recentBlinks.Count > 10)
+                                recentBlinks.Dequeue();
+                            
+                            OnBlinkDetected?.Invoke(blinkEvent);
+                        }
+                    }
+                }
+            }
+            
+            public bool IsBlinkDetected()
+            {
+                if (recentBlinks.Count > 0)
+                {
+                    var lastBlink = recentBlinks.Last();
+                    return (DateTime.Now - lastBlink.Time).TotalSeconds < 0.1;
+                }
+                return false;
+            }
+            
+            public double GetLastBlinkStrength()
+            {
+                if (recentBlinks.Count > 0)
+                    return recentBlinks.Last().Strength;
+                return 0;
+            }
+        }
+
+        // ============================================================================
+        // Main Form Variables
+        // ============================================================================
+        
+        // Serial port
+        private SerialPort serialPort;
+        private BlinkDetectorParser parser;
+        
+        // Threading
+        private Thread readThread;
         private bool isRunning = false;
-        private Thread dataThread;
-        private string comPort = "COM4";
-
-        // NeuroSky data
-        private int packetCount = 0;
-        private int attentionValue = 0;
-        private int blinkStrength = 0;
-        private int poorSignal = 255;
-
+        
         // Patient info
         private string patientName = "PATIENT";
         private string roomNumber = "ROOM";
@@ -32,25 +333,25 @@ namespace PatientCommunicationSystem
         private int currentWordIndex = 0;
         private string selectedMessage = "";
         private List<string> messageHistory = new List<string>();
-
         private Dictionary<Category, List<string>> wordCategories;
 
-        // Blink detection
-        private DateTime lastBlinkTime = DateTime.MinValue;
+        // Blink detection for navigation
+        private DateTime lastBlinkDetectionTime = DateTime.MinValue;
         private int blinkSequenceCount = 0;
         private DateTime sequenceStartTime = DateTime.MinValue;
         private TimeSpan blinkCooldown = TimeSpan.FromMilliseconds(750);
-        private int blinkThreshold = 40;
-        private bool blinkDetected = false;
-        private int rawValue = 0;
-        private const int RAW_BLINK_THRESHOLD = 450;
-
+        private int totalBlinks = 0;
+        private double lastBlinkStrength = 0;
+        
         private enum Mode { Category, Word, Confirm }
         private Mode currentMode = Mode.Category;
-
         private bool emergencyMode = false;
         private bool audioFeedback = true;
         private bool isConnected = false;
+
+        // CSV logging
+        private StreamWriter csvWriter;
+        private string csvFilename;
 
         // UI Controls
         private System.Windows.Forms.Timer uiTimer;
@@ -72,7 +373,6 @@ namespace PatientCommunicationSystem
 
         public MainForm()
         {
-            // Form settings first
             this.Text = "Patient Communication System - Blink Controlled";
             this.Size = new Size(1100, 700);
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -82,6 +382,88 @@ namespace PatientCommunicationSystem
             InitializeComponent();
             InitializeWordCategories();
             LoadSettings();
+            InitializeParser();
+        }
+
+        private void InitializeParser()
+        {
+            parser = new BlinkDetectorParser();
+            parser.OnBlinkDetected += Parser_OnBlinkDetected;
+        }
+
+        private void Parser_OnBlinkDetected(BlinkDetectorParser.BlinkEvent blinkEvent)
+        {
+            // This is called from background thread, need to invoke UI thread
+            if (this.InvokeRequired)
+            {
+                this.Invoke(new Action<BlinkDetectorParser.BlinkEvent>(Parser_OnBlinkDetected), blinkEvent);
+                return;
+            }
+
+            totalBlinks = parser.blinkCount;
+            lastBlinkStrength = blinkEvent.Strength;
+            
+            // Process blink for navigation
+            ProcessNavigationBlink();
+        }
+
+        private void ProcessNavigationBlink()
+        {
+            DateTime now = DateTime.Now;
+
+            // Apply cooldown
+            if ((now - lastBlinkDetectionTime) < blinkCooldown) return;
+
+            // Reset sequence if too long since last blink
+            if ((now - sequenceStartTime) > TimeSpan.FromMilliseconds(800))
+                blinkSequenceCount = 0;
+
+            if (blinkSequenceCount == 0)
+                sequenceStartTime = now;
+
+            blinkSequenceCount++;
+            lastBlinkDetectionTime = now;
+
+            // Process based on blink count
+            switch (blinkSequenceCount)
+            {
+                case 1:
+                    Navigate();
+                    if (audioFeedback) Console.Beep(1000, 50);
+                    break;
+                case 2:
+                    if ((now - sequenceStartTime) < TimeSpan.FromMilliseconds(600))
+                    {
+                        SelectItem();
+                        if (audioFeedback) Console.Beep(1500, 100);
+                        blinkSequenceCount = 0;
+                    }
+                    break;
+                case 3:
+                    if ((now - sequenceStartTime) < TimeSpan.FromMilliseconds(900))
+                    {
+                        Emergency();
+                        if (audioFeedback) Console.Beep(3000, 200);
+                        blinkSequenceCount = 0;
+                    }
+                    break;
+                case 4:
+                    if ((now - sequenceStartTime) < TimeSpan.FromMilliseconds(1200))
+                    {
+                        ResetSystem();
+                        if (audioFeedback)
+                        {
+                            Console.Beep(800, 300);
+                            Console.Beep(600, 300);
+                        }
+                        blinkSequenceCount = 0;
+                    }
+                    break;
+            }
+
+            // Auto-reset sequence after timeout
+            if ((DateTime.Now - sequenceStartTime) >= TimeSpan.FromMilliseconds(1000))
+                blinkSequenceCount = 0;
         }
 
         private void InitializeComponent()
@@ -185,13 +567,12 @@ namespace PatientCommunicationSystem
             sensitivityTrackBar = new TrackBar();
             sensitivityTrackBar.Minimum = 20;
             sensitivityTrackBar.Maximum = 80;
-            sensitivityTrackBar.Value = blinkThreshold;
+            sensitivityTrackBar.Value = 40;
             sensitivityTrackBar.Location = new Point(500, 45);
             sensitivityTrackBar.Size = new Size(150, 45);
-            sensitivityTrackBar.Scroll += (s, e) => blinkThreshold = sensitivityTrackBar.Value;
 
             Label sensitivityValue = new Label();
-            sensitivityValue.Text = blinkThreshold.ToString();
+            sensitivityValue.Text = "40";
             sensitivityValue.ForeColor = Color.White;
             sensitivityValue.Location = new Point(660, 50);
             sensitivityValue.Size = new Size(40, 25);
@@ -213,7 +594,7 @@ namespace PatientCommunicationSystem
             controlPanel.Controls.Add(sensitivityValue);
             controlPanel.Controls.Add(instructionsLabel);
 
-            // Display Panel (Categories/Words)
+            // Display Panel
             Panel displayPanel = new Panel();
             displayPanel.Location = new Point(10, 140);
             displayPanel.Size = new Size(700, 450);
@@ -306,6 +687,7 @@ namespace PatientCommunicationSystem
             this.Controls.Add(displayPanel);
             this.Controls.Add(historyPanel);
             this.Controls.Add(statusStrip);
+            this.MainMenuStrip = menuStrip;
 
             // Timer for UI updates
             uiTimer = new System.Windows.Forms.Timer();
@@ -381,20 +763,88 @@ namespace PatientCommunicationSystem
             };
         }
 
+        // ============================================================================
+        // Serial Port Connection (Following Python Structure)
+        // ============================================================================
+
+        private string FindHeadsetPort()
+        {
+            string[] ports = SerialPort.GetPortNames();
+            
+            foreach (string portName in ports)
+            {
+                try
+                {
+                    using (SerialPort testPort = new SerialPort(portName, BAUDRATE))
+                    {
+                        testPort.ReadTimeout = 500;
+                        testPort.Open();
+                        Thread.Sleep(500);
+                        
+                        if (testPort.BytesToRead > 0)
+                        {
+                            return portName;
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    continue;
+                }
+            }
+            return null;
+        }
+
         private void Connect()
         {
-            if (ConnectToHeadset(comPort))
+            string comPort = "COM4";  // Default, can be changed via settings
+            
+            // Try to find headset if default port fails
+            if (!System.IO.Ports.SerialPort.GetPortNames().Contains(comPort))
             {
+                comPort = FindHeadsetPort();
+            }
+            
+            if (string.IsNullOrEmpty(comPort))
+            {
+                MessageBox.Show("No NeuroSky headset found! Please check:\n" +
+                    "1. Headset is ON\n" +
+                    "2. USB dongle is plugged in\n" +
+                    "3. Try unplugging/replugging dongle",
+                    "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            try
+            {
+                serialPort = new SerialPort(comPort, BAUDRATE);
+                serialPort.ReadTimeout = 10;
+                serialPort.Open();
+                
+                // Initialize CSV logging
+                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                csvFilename = $"blink_data_{timestamp}.csv";
+                csvWriter = new StreamWriter(csvFilename);
+                csvWriter.WriteLine("timestamp,packet, poor_signal, attention, meditation, header_blink, raw_blink, blink_strength, raw_value, total_blinks");
+                csvWriter.Flush();
+                
+                isRunning = true;
+                readThread = new Thread(ReadSerialData);
+                readThread.Start();
+                
                 isConnected = true;
                 connectionStatus.Text = "● Connected";
                 connectionStatus.ForeColor = Color.Green;
                 connectButton.Enabled = false;
                 disconnectButton.Enabled = true;
-                AddToHistory("System connected");
+                
+                AddToHistory($"Connected to {comPort}");
+                AddToHistory($"Logging to: {csvFilename}");
+                AddToHistory("Calibrating... Please blink normally");
             }
-            else
+            catch (Exception ex)
             {
-                MessageBox.Show($"Failed to connect to {comPort}. Check headset and try again.",
+                MessageBox.Show($"Failed to connect: {ex.Message}",
                     "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
@@ -402,125 +852,79 @@ namespace PatientCommunicationSystem
         private void Disconnect()
         {
             isRunning = false;
-            if (dataThread != null && dataThread.IsAlive)
-                dataThread.Join(1000);
-            if (connectionId != 0)
+            
+            if (readThread != null && readThread.IsAlive)
+                readThread.Join(1000);
+            
+            if (serialPort != null && serialPort.IsOpen)
+                serialPort.Close();
+            
+            if (csvWriter != null)
             {
-                NativeThinkgear.TG_Disconnect(connectionId);
-                NativeThinkgear.TG_FreeConnection(connectionId);
+                csvWriter.Close();
+                csvWriter = null;
             }
+            
             isConnected = false;
             connectionStatus.Text = "● Disconnected";
             connectionStatus.ForeColor = Color.Red;
             connectButton.Enabled = true;
             disconnectButton.Enabled = false;
-            AddToHistory("System disconnected");
+            
+            AddToHistory("Disconnected");
         }
 
-        private bool ConnectToHeadset(string port)
-        {
-            connectionId = NativeThinkgear.TG_GetNewConnectionId();
-            if (connectionId < 0) return false;
-
-            int errCode = NativeThinkgear.TG_Connect(connectionId, port,
-                NativeThinkgear.TG_BAUD_57600, NativeThinkgear.TG_STREAM_PACKETS);
-
-            if (errCode < 0) return false;
-
-            isRunning = true;
-            dataThread = new Thread(ReadDataThread);
-            dataThread.Start();
-
-            return true;
-        }
-
-        private void ReadDataThread()
+        private void ReadSerialData()
         {
             while (isRunning)
             {
-                int packetsRead = NativeThinkgear.TG_ReadPackets(connectionId, -1);
-                if (packetsRead > 0)
+                try
                 {
-                    // Check for Raw EEG data
-                    if (NativeThinkgear.TG_GetValueStatus(connectionId, NativeThinkgear.TG_DATA_RAW) != 0)
+                    if (serialPort != null && serialPort.IsOpen && serialPort.BytesToRead > 0)
                     {
-                        rawValue = (int)NativeThinkgear.TG_GetValue(connectionId, NativeThinkgear.TG_DATA_RAW);
-
-                        // BLINK DETECTION LOGIC:
-                        // If raw value exceeds a high threshold, it's almost certainly a blink.
-                        if (Math.Abs(rawValue) > RAW_BLINK_THRESHOLD && !blinkDetected)
+                        byte[] data = new byte[serialPort.BytesToRead];
+                        serialPort.Read(data, 0, data.Length);
+                        
+                        foreach (byte b in data)
                         {
-                            blinkDetected = true;
-                            ProcessBlink();
+                            parser.FeedByte(b);
                         }
-                        else if (Math.Abs(rawValue) < 100 && blinkDetected)
+                        
+                        // Log raw samples to CSV
+                        if (parser.rawSamples.Count > 0)
                         {
-                            // Reset detection when signal returns toward baseline
-                            blinkDetected = false;
+                            foreach (int rawVal in parser.rawSamples)
+                            {
+                                if (csvWriter != null)
+                                {
+                                    lock (csvWriter)
+                                    {
+                                        csvWriter.WriteLine($"{DateTime.Now:O},{parser.packetCount}," +
+                                            $"{parser.poorSignal},{parser.attention},{parser.meditation}," +
+                                            $"{(parser.blinkStrength > 0 ? 1 : 0)},{(parser.IsBlinkDetected() ? 1 : 0)}," +
+                                            $"{parser.GetLastBlinkStrength()},{rawVal},{parser.blinkCount}");
+                                        csvWriter.Flush();
+                                    }
+                                }
+                            }
+                            parser.rawSamples.Clear();
                         }
                     }
-
-                    // Keep your existing code for Signal and Attention labels...
                 }
-                Thread.Sleep(2); // Reduced sleep for higher resolution tracking (512Hz)
+                catch (Exception ex)
+                {
+                    // Handle timeout and other exceptions
+                    if (isRunning)
+                    {
+                        Console.WriteLine($"Serial read error: {ex.Message}");
+                    }
+                }
+                
+                Thread.Sleep(1);
             }
         }
 
-        private void ProcessBlink()
-        {
-            DateTime now = DateTime.Now;
-
-            if ((now - lastBlinkTime) < blinkCooldown) return;
-
-            if ((now - sequenceStartTime) > TimeSpan.FromMilliseconds(800))
-                blinkSequenceCount = 0;
-
-            if (blinkSequenceCount == 0)
-                sequenceStartTime = now;
-
-            blinkSequenceCount++;
-            lastBlinkTime = now;
-
-            switch (blinkSequenceCount)
-            {
-                case 1:
-                    this.Invoke(new Action(() => Navigate()));
-                    if (audioFeedback) Console.Beep(1000, 50);
-                    break;
-                case 2:
-                    if ((now - sequenceStartTime) < TimeSpan.FromMilliseconds(600))
-                    {
-                        this.Invoke(new Action(() => SelectItem()));
-                        if (audioFeedback) Console.Beep(1500, 100);
-                        blinkSequenceCount = 0;
-                    }
-                    break;
-                case 3:
-                    if ((now - sequenceStartTime) < TimeSpan.FromMilliseconds(900))
-                    {
-                        this.Invoke(new Action(() => Emergency()));
-                        if (audioFeedback) Console.Beep(3000, 200);
-                        blinkSequenceCount = 0;
-                    }
-                    break;
-                case 4:
-                    if ((now - sequenceStartTime) < TimeSpan.FromMilliseconds(1200))
-                    {
-                        this.Invoke(new Action(() => ResetSystem()));
-                        if (audioFeedback)
-                        {
-                            Console.Beep(800, 300);
-                            Console.Beep(600, 300);
-                        }
-                        blinkSequenceCount = 0;
-                    }
-                    break;
-            }
-
-            if ((DateTime.Now - sequenceStartTime) >= TimeSpan.FromMilliseconds(1000))
-                blinkSequenceCount = 0;
-        }
-
+        // Navigation Methods
         private void Navigate()
         {
             if (emergencyMode) return;
@@ -539,7 +943,7 @@ namespace PatientCommunicationSystem
             }
         }
 
-        private void SelectItem()  // Renamed from Select() to avoid conflict
+        private void SelectItem()
         {
             if (emergencyMode) return;
 
@@ -564,12 +968,6 @@ namespace PatientCommunicationSystem
 
         private void RefreshWordList()
         {
-            if (wordListBox.InvokeRequired)
-            {
-                wordListBox.Invoke(new Action(RefreshWordList));
-                return;
-            }
-
             wordListBox.Items.Clear();
             foreach (string word in wordCategories[currentCategory])
             {
@@ -599,12 +997,10 @@ namespace PatientCommunicationSystem
             messageDisplayLabel.Text = $"✓ SENT: {selectedMessage}";
             messageDisplayLabel.BackColor = Color.DarkGreen;
 
-            // Reset after sending
             currentMode = Mode.Category;
             currentWordIndex = 0;
             selectedMessage = "";
 
-            // Reset display after 3 seconds
             System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
             timer.Interval = 3000;
             timer.Tick += (s, e) =>
@@ -657,17 +1053,19 @@ namespace PatientCommunicationSystem
         {
             if (!isConnected) return;
 
-            string signalText = poorSignal == 0 ? "Good" : poorSignal < 50 ? "Fair" : "Poor";
+            string signalText = parser.poorSignal == 0 ? "Good" : parser.poorSignal < 50 ? "Fair" : "Poor";
             signalStatus.Text = $"Signal: {signalText}";
-            signalStatus.ForeColor = poorSignal == 0 ? Color.Green : poorSignal < 50 ? Color.Yellow : Color.Red;
-            attentionStatus.Text = $"Attention: {attentionValue}";
-            blinkStatus.Text = $"Blink: {blinkStrength}";
+            signalStatus.ForeColor = parser.poorSignal == 0 ? Color.Green : parser.poorSignal < 50 ? Color.Yellow : Color.Red;
+            attentionStatus.Text = $"Attention: {parser.attention}";
+            
+            string calStatus = parser.isCalibrated ? "Calibrated" : "Calibrating...";
+            blinkStatus.Text = $"Blinks: {totalBlinks} | {calStatus}";
 
             if (!emergencyMode)
             {
                 if (currentMode == Mode.Category)
                 {
-                    modeLabel.Text = "Mode: SELECT CATEGORY (1 blink=next, 2 blinks=select)";
+                    modeLabel.Text = $"Mode: SELECT CATEGORY ({calStatus})";
                     categoryListBox.Visible = true;
                     wordListBox.Visible = false;
 
@@ -680,9 +1078,13 @@ namespace PatientCommunicationSystem
                 }
                 else if (currentMode == Mode.Word)
                 {
-                    modeLabel.Text = $"Mode: SELECT MESSAGE - {currentCategory} (1 blink=next, 2 blinks=select)";
+                    modeLabel.Text = $"Mode: SELECT MESSAGE - {currentCategory}";
                     categoryListBox.Visible = false;
                     wordListBox.Visible = true;
+                }
+                else if (currentMode == Mode.Confirm)
+                {
+                    modeLabel.Text = "Mode: CONFIRM MESSAGE";
                 }
             }
             else
@@ -694,30 +1096,24 @@ namespace PatientCommunicationSystem
 
         private void AddToHistory(string message)
         {
-            if (historyListBox.InvokeRequired)
-            {
-                historyListBox.Invoke(new Action<string>(AddToHistory), message);
-                return;
-            }
-
             messageHistory.Add(message);
             historyListBox.Items.Insert(0, message);
             if (historyListBox.Items.Count > 100)
                 historyListBox.Items.RemoveAt(historyListBox.Items.Count - 1);
         }
 
+        // Settings and Utility Methods
         private void ShowComPortDialog()
         {
             string result = Microsoft.VisualBasic.Interaction.InputBox(
                 "Enter COM Port (e.g., COM3, COM4, COM5):",
                 "COM Port Settings",
-                comPort);
+                "COM4");
 
             if (!string.IsNullOrWhiteSpace(result))
             {
-                comPort = result.ToUpper();
                 SaveSettings();
-                MessageBox.Show($"COM port set to {comPort}. Reconnect to apply.",
+                MessageBox.Show($"COM port set to {result}. Reconnect to apply.",
                     "Settings Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
         }
@@ -747,10 +1143,14 @@ namespace PatientCommunicationSystem
                 "• 3 BLINKS → EMERGENCY\n" +
                 "• 4 BLINKS → Reset all\n\n" +
                 "WORKFLOW:\n" +
-                "1. Blink twice to select a category\n" +
-                "2. Blink twice to select a message\n" +
-                "3. Blink twice to confirm and send\n\n" +
-                "All messages are logged and can be exported.",
+                "1. Wait for calibration (10 seconds)\n" +
+                "2. Blink twice to select a category\n" +
+                "3. Blink twice to select a message\n" +
+                "4. Blink twice to confirm and send\n\n" +
+                "DETECTION:\n" +
+                "• Auto-calibrates to your blinks\n" +
+                "• Works with raw EEG data\n" +
+                "• Cooldown prevents double-detection",
                 "Instructions", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
@@ -758,7 +1158,7 @@ namespace PatientCommunicationSystem
         {
             using (SaveFileDialog dialog = new SaveFileDialog())
             {
-                dialog.Filter = "Log files (*.log)|*.log|Text files (*.txt)|*.txt";
+                dialog.Filter = "Log files (*.log)|*.log|Text files (*.txt)|*.txt|CSV files (*.csv)|*.csv";
                 dialog.FileName = $"PatientComm_{patientName}_{DateTime.Now:yyyyMMdd_HHmmss}.log";
 
                 if (dialog.ShowDialog() == DialogResult.OK)
@@ -780,14 +1180,10 @@ namespace PatientCommunicationSystem
                     string[] lines = File.ReadAllLines(configFile);
                     foreach (string line in lines)
                     {
-                        if (line.StartsWith("ComPort="))
-                            comPort = line.Substring(8);
-                        else if (line.StartsWith("PatientName="))
+                        if (line.StartsWith("PatientName="))
                             patientName = line.Substring(12);
                         else if (line.StartsWith("RoomNumber="))
                             roomNumber = line.Substring(11);
-                        else if (line.StartsWith("BlinkThreshold="))
-                            int.TryParse(line.Substring(15), out blinkThreshold);
                     }
                 }
                 catch { }
@@ -800,10 +1196,8 @@ namespace PatientCommunicationSystem
             {
                 File.WriteAllLines("PatientComm.config", new[]
                 {
-                    $"ComPort={comPort}",
                     $"PatientName={patientName}",
-                    $"RoomNumber={roomNumber}",
-                    $"BlinkThreshold={blinkThreshold}"
+                    $"RoomNumber={roomNumber}"
                 });
             }
             catch { }
