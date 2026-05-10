@@ -1,0 +1,12 @@
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\obj\x64\Debug\PatientCommunicationSystem.csproj.AssemblyReference.cache
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\obj\x64\Debug\PatientCommunicationSystem.Properties.Resources.resources
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\obj\x64\Debug\PatientCommunicationSystem.csproj.GenerateResource.cache
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\obj\x64\Debug\PatientCommunicationSystem.csproj.CoreCompileInputs.cache
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\bin\x64\Debug\Properties\thinkgear64.dll
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\bin\x64\Debug\PatientCommunicationSystem.exe.config
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\bin\x64\Debug\PatientCommunicationSystem.exe
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\bin\x64\Debug\PatientCommunicationSystem.pdb
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\obj\x64\Debug\PatientCommunicationSystem.exe
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\obj\x64\Debug\PatientCommunicationSystem.pdb
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\bin\x64\Debug\Program.cs
+C:\Users\Paul\source\repos\PatientCommunicationSystem\PatientCommunicationSystem\bin\x64\Debug\thinkgear64.dll
